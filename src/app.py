@@ -8,6 +8,184 @@ import plotly.express as px
 
 # ---------- Page Setup ----------
 st.set_page_config(page_title="AI Insight Agent", layout="wide")
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700;800&display=swap');
+
+* {
+    font-family: 'Space Grotesk', sans-serif;
+}
+
+/* Animated gradient background */
+.stApp {
+    background: linear-gradient(-45deg, #0a0e27, #1e0a3c, #0a1e3c, #1a0a2e);
+    background-size: 400% 400%;
+    animation: gradientShift 15s ease infinite;
+}
+
+@keyframes gradientShift {
+    0% { background-position: 0% 50%; }
+    50% { background-position: 100% 50%; }
+    100% { background-position: 0% 50%; }
+}
+
+/* Glowing orbs floating in background */
+.stApp::before {
+    content: "";
+    position: fixed;
+    top: 10%; left: 5%;
+    width: 400px; height: 400px;
+    background: radial-gradient(circle, rgba(139, 92, 246, 0.25) 0%, transparent 70%);
+    border-radius: 50%;
+    filter: blur(40px);
+    animation: float1 8s ease-in-out infinite;
+    pointer-events: none;
+    z-index: 0;
+}
+
+.stApp::after {
+    content: "";
+    position: fixed;
+    bottom: 10%; right: 5%;
+    width: 450px; height: 450px;
+    background: radial-gradient(circle, rgba(59, 130, 246, 0.25) 0%, transparent 70%);
+    border-radius: 50%;
+    filter: blur(40px);
+    animation: float2 10s ease-in-out infinite;
+    pointer-events: none;
+    z-index: 0;
+}
+
+@keyframes float1 {
+    0%, 100% { transform: translate(0, 0); }
+    50% { transform: translate(50px, 30px); }
+}
+
+@keyframes float2 {
+    0%, 100% { transform: translate(0, 0); }
+    50% { transform: translate(-40px, -40px); }
+}
+
+/* Grid pattern overlay */
+[data-testid="stAppViewContainer"] > .main {
+    background-image: 
+        linear-gradient(rgba(139, 92, 246, 0.06) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(139, 92, 246, 0.06) 1px, transparent 1px);
+    background-size: 35px 35px;
+}
+
+/* Title - big glowing gradient text */
+h1 {
+    background: linear-gradient(90deg, #a78bfa, #60a5fa, #a78bfa);
+    background-size: 200% auto;
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    animation: shine 4s linear infinite;
+    font-weight: 800 !important;
+    font-size: 3rem !important;
+    text-shadow: 0 0 40px rgba(139, 92, 246, 0.3);
+}
+
+@keyframes shine {
+    to { background-position: 200% center; }
+}
+
+h2, h3 {
+    color: #c4b5fd !important;
+    font-weight: 700 !important;
+}
+
+p, .stMarkdown {
+    color: #cbd5e1;
+}
+
+/* KPI metric cards - glassmorphism with glow border */
+[data-testid="stMetric"] {
+    background: rgba(139, 92, 246, 0.08);
+    border: 1px solid rgba(139, 92, 246, 0.3);
+    border-radius: 16px;
+    padding: 24px;
+    backdrop-filter: blur(12px);
+    transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);
+}
+
+[data-testid="stMetric"]:hover {
+    border: 1px solid rgba(167, 139, 250, 0.8);
+    box-shadow: 0 0 30px rgba(139, 92, 246, 0.4), inset 0 0 20px rgba(139, 92, 246, 0.05);
+    transform: translateY(-4px);
+}
+
+[data-testid="stMetricValue"] {
+    background: linear-gradient(90deg, #a78bfa, #60a5fa);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    font-weight: 800 !important;
+}
+
+/* Buttons - vibrant glow */
+.stButton > button {
+    background: linear-gradient(90deg, #7c3aed, #3b82f6);
+    color: white;
+    border: none;
+    border-radius: 10px;
+    font-weight: 700;
+    padding: 12px 32px;
+    box-shadow: 0 4px 15px rgba(124, 58, 237, 0.4);
+    transition: all 0.3s ease;
+}
+
+.stButton > button:hover {
+    box-shadow: 0 0 35px rgba(124, 58, 237, 0.7);
+    transform: translateY(-2px) scale(1.02);
+}
+
+/* Text input */
+.stTextInput > div > div > input {
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(139, 92, 246, 0.4);
+    color: white;
+    border-radius: 10px;
+    padding: 12px;
+    font-size: 1rem;
+}
+
+.stTextInput > div > div > input:focus {
+    border: 1px solid rgba(167, 139, 250, 1);
+    box-shadow: 0 0 20px rgba(139, 92, 246, 0.3);
+}
+
+/* Divider glow */
+hr {
+    border: none !important;
+    height: 1px !important;
+    background: linear-gradient(90deg, transparent, rgba(139, 92, 246, 0.6), transparent) !important;
+}
+
+/* Sidebar */
+[data-testid="stSidebar"] {
+    background: rgba(10, 14, 39, 0.9);
+    border-right: 1px solid rgba(139, 92, 246, 0.25);
+}
+
+[data-testid="stSidebar"] a {
+    color: #a78bfa !important;
+}
+
+/* Expander */
+.streamlit-expanderHeader {
+    background: rgba(139, 92, 246, 0.1);
+    border-radius: 10px;
+    border: 1px solid rgba(139, 92, 246, 0.2);
+}
+
+/* Dataframe */
+[data-testid="stDataFrame"] {
+    border: 1px solid rgba(139, 92, 246, 0.2);
+    border-radius: 10px;
+}
+</style>
+""", unsafe_allow_html=True)
 
 # ---------- Backend Setup ----------
 load_dotenv()
