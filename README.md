@@ -2,8 +2,7 @@
 
 A statistically-verified, AI-queryable analytics tool built on 3.4M+ real Instacart grocery orders. Instead of just displaying dashboards, this system lets users ask business questions in plain English and get AI-generated, statistically-grounded answers — combining traditional BI with a natural-language reasoning layer.
 
-**[🔗 Live Demo](#)** *(add link after deployment)* | **[📊 GitHub](https://github.com/Bhaskar-Black/ai-insight-agent)**
-
+**[🔗 Live Demo](https://tumhara-actual-app-url.streamlit.app)** | **[📊 GitHub](https://github.com/Bhaskar-Black/ai-insight-agent)**
 ---
 
 ## Why This Project
