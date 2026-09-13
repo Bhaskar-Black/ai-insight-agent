@@ -14,9 +14,16 @@ st.markdown("""<style>
 </style>""", unsafe_allow_html=True)
 
 # ---------- Backend Setup ----------
-load_dotenv()
-api_key = os.getenv("GEMINI_API_KEY")
-db_url = os.getenv("DATABASE_URL")
+import streamlit as st
+
+# Local mein .env se, deployed mein st.secrets se
+if "GEMINI_API_KEY" in st.secrets:
+    api_key = st.secrets["GEMINI_API_KEY"]
+    db_url = st.secrets["DATABASE_URL"]
+else:
+    load_dotenv()
+    api_key = os.getenv("GEMINI_API_KEY")
+    db_url = os.getenv("DATABASE_URL")
 
 client = genai.Client(api_key=api_key)
 conn = create_engine(db_url)
