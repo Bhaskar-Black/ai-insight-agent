@@ -5,6 +5,8 @@ from dotenv import load_dotenv
 from google import genai
 from sqlalchemy import create_engine
 import plotly.express as px
+import sqlite3
+import json
 
 # ---------- Page Setup ----------
 st.set_page_config(page_title="AI Insight Agent", layout="wide")
@@ -17,10 +19,10 @@ st.markdown("""<style>
 import streamlit as st
 
 # Local mein .env se, deployed mein st.secrets se
-if "GEMINI_API_KEY" in st.secrets:
+try:
     api_key = st.secrets["GEMINI_API_KEY"]
     db_url = st.secrets["DATABASE_URL"]
-else:
+except (FileNotFoundError, KeyError):
     load_dotenv()
     api_key = os.getenv("GEMINI_API_KEY")
     db_url = os.getenv("DATABASE_URL")
@@ -143,3 +145,170 @@ with st.sidebar:
     st.markdown("📧 [sparsh4142@gmail.com](mailto:sparsh4142@gmail.com)")
     st.markdown("🔗 [GitHub](https://github.com/Bhaskar-Black)")
     st.markdown("🔗 [LinkedIn](https://linkedin.com/in/bhaskarstackanalyst)")
+
+# ============================================================
+# SECTION: Upload Your Own Data
+# ============================================================
+st.divider()
+st.header("📁 Upload Your Own Data")
+st.write("Upload one or more CSVs — join them, visualize, and ask AI questions.")
+
+uploaded_files = st.file_uploader("Choose CSV file(s)", type="csv", accept_multiple_files=True)
+
+if uploaded_files:
+    tables = {}
+    for f in uploaded_files:
+        table_name = f.name.replace(".csv", "")
+        tables[table_name] = pd.read_csv(f)
+
+    st.success(f"Loaded {len(tables)} table(s): {', '.join(tables.keys())}")
+
+    with st.expander("Preview tables"):
+        for name, tdf in tables.items():
+            st.markdown(f"**{name}** ({len(tdf):,} rows)")
+            st.dataframe(tdf.head(5))
+
+    working_df = None
+
+    if len(tables) == 1:
+        working_df = list(tables.values())[0]
+        st.info("Only one table uploaded — using it directly.")
+    else:
+        st.subheader("🔗 Join Your Tables")
+        st.write("Start with a base table, then add tables one by one by choosing the join column each time.")
+
+        table_names = list(tables.keys())
+        base_table = st.selectbox("Start with base table", table_names, key="base_table")
+
+        if "join_steps" not in st.session_state:
+            st.session_state["join_steps"] = []
+
+        remaining_tables = [t for t in table_names if t != base_table]
+
+        if remaining_tables:
+            st.markdown("**Add a table to join:**")
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+                next_table = st.selectbox("Join with", remaining_tables, key="next_table")
+
+            current_cols = tables[base_table].columns.tolist()
+            for step in st.session_state["join_steps"]:
+                if step["result_cols"]:
+                    current_cols = step["result_cols"]
+
+            with col2:
+                left_key = st.selectbox("Column from current data", current_cols, key=f"left_key_{len(st.session_state['join_steps'])}")
+            with col3:
+                right_key = st.selectbox(f"Column from {next_table}", tables[next_table].columns.tolist(), key=f"right_key_{len(st.session_state['join_steps'])}")
+
+            join_type = st.selectbox("Join type", ["left", "inner", "right", "outer"], index=0, key=f"join_type_{len(st.session_state['join_steps'])}")
+
+            if st.button("➕ Add This Join"):
+                st.session_state["join_steps"].append({
+                    "table": next_table,
+                    "left_key": left_key,
+                    "right_key": right_key,
+                    "join_type": join_type,
+                    "result_cols": None
+                })
+                st.rerun()
+
+        working_df = tables[base_table].copy()
+        for i, step in enumerate(st.session_state["join_steps"]):
+            try:
+                working_df = working_df.merge(
+                    tables[step["table"]],
+                    left_on=step["left_key"],
+                    right_on=step["right_key"],
+                    how=step["join_type"]
+                )
+                st.session_state["join_steps"][i]["result_cols"] = working_df.columns.tolist()
+            except Exception as e:
+                st.error(f"Join step {i+1} failed: {e}")
+                working_df = None
+                break
+
+        if st.session_state["join_steps"] and working_df is not None:
+            st.success(f"Joined {len(st.session_state['join_steps'])+1} tables → {len(working_df):,} rows, {len(working_df.columns)} columns.")
+            with st.expander("Preview joined data"):
+                st.dataframe(working_df.head(10))
+
+            if st.button("🔄 Reset Joins"):
+                st.session_state["join_steps"] = []
+                st.rerun()
+        elif not st.session_state["join_steps"]:
+            st.info("Add at least one join above to combine tables.")
+            working_df = None
+
+    # ---------- Only proceed if we have working_df ----------
+    if working_df is not None:
+
+        st.subheader("📊 Choose up to 4 columns to visualize")
+        selected_cols = st.multiselect(
+            "Select columns",
+            options=working_df.columns.tolist(),
+            max_selections=4,
+            key="viz_cols"
+        )
+
+        if selected_cols:
+            for col in selected_cols:
+                st.markdown(f"#### {col}")
+
+                if pd.api.types.is_numeric_dtype(working_df[col]):
+                    fig = px.histogram(working_df, x=col, title=f"Distribution of {col}")
+                else:
+                    value_counts = working_df[col].value_counts().reset_index().head(15)
+                    value_counts.columns = [col, 'count']
+                    fig = px.bar(value_counts, x=col, y='count', title=f"Top values in {col}")
+
+                st.plotly_chart(fig, use_container_width=True)
+
+                explain_prompt = f"""Column name: {col}
+Data type: {working_df[col].dtype}
+Sample values: {working_df[col].dropna().head(5).tolist()}
+Basic stats: {working_df[col].describe().to_dict()}
+
+In 1-2 short sentences, explain what this data likely represents and one notable pattern in it. Be concise and business-friendly."""
+
+                insight = client.models.generate_content(model="gemini-3.6-flash", contents=explain_prompt)
+                st.info(f"💡 {insight.text.strip()}")
+
+        st.divider()
+        st.subheader("💬 Ask AI About This Data")
+
+        user_conn = sqlite3.connect(":memory:")
+        working_df.to_sql("uploaded_data", user_conn, index=False, if_exists="replace")
+
+        dynamic_schema = f"Table: uploaded_data({', '.join(working_df.columns.tolist())})"
+
+        user_question_upload = st.text_input("Ask a question about your data", key="upload_question")
+
+        if st.button("Ask", key="upload_ask_button") and user_question_upload:
+            with st.spinner("Analyzing..."):
+                plan_prompt = f"""You are a data analyst. Given this table schema:
+{dynamic_schema}
+
+The user asked: "{user_question_upload}"
+
+Return ONLY a valid SQLite query to answer this. No markdown, no explanation."""
+
+                plan_resp = client.models.generate_content(model="gemini-3.6-flash", contents=plan_prompt)
+                sql_q = plan_resp.text.strip().replace("```sql", "").replace("```", "").strip()
+
+                try:
+                    result_df = pd.read_sql_query(sql_q, user_conn)
+                    explain_prompt2 = f"""The user asked: "{user_question_upload}"
+Result:
+{result_df.to_string(index=False)}
+
+Answer in one clear, business-friendly sentence with specific numbers. Do not mention SQL."""
+                    final_ans = client.models.generate_content(model="gemini-3.6-flash", contents=explain_prompt2)
+
+                    st.markdown(f"**💡 Answer:** {final_ans.text.strip()}")
+                    with st.expander("See query and raw result"):
+                        st.code(sql_q, language="sql")
+                        st.dataframe(result_df)
+                except Exception as e:
+                    st.error(f"Couldn't process that question: {e}")
