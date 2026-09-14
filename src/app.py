@@ -8,7 +8,9 @@ import plotly.express as px
 import sqlite3
 import json
 
-# ---------- Page Setup ----------
+# ============================================================
+# SECTION 1: PAGE SETUP
+# ============================================================
 st.set_page_config(page_title="AI Insight Agent", layout="wide")
 
 st.markdown("""
@@ -179,10 +181,9 @@ hr {
 </style>
 """, unsafe_allow_html=True)
 
-# ---------- Backend Setup ----------
-import streamlit as st
-
-# Local mein .env se, deployed mein st.secrets se
+# ============================================================
+# SECTION 2: BACKEND SETUP (API key, DB connection)
+# ============================================================
 try:
     api_key = st.secrets["GEMINI_API_KEY"]
     db_url = st.secrets["DATABASE_URL"]
@@ -203,7 +204,29 @@ Tables:
 5. departments(department_id, department)
 """
 
+# ============================================================
+# SECTION 3: SQL SAFETY GUARD
+# Blocks any AI-generated SQL that isn't a plain SELECT query.
+# ============================================================
+def is_safe_sql(query):
+    """Only allow SELECT statements - block anything that modifies data."""
+    normalized = query.strip().upper()
 
+    if not normalized.startswith("SELECT"):
+        return False
+
+    dangerous_keywords = ["DROP", "DELETE", "INSERT", "UPDATE", "ALTER",
+                           "TRUNCATE", "CREATE", "GRANT", "REVOKE", "EXEC", "EXECUTE"]
+    for keyword in dangerous_keywords:
+        if keyword in normalized:
+            return False
+
+    return True
+
+# ============================================================
+# SECTION 4: AI QUERY FUNCTION (for the main Instacart dataset)
+# Plans queries -> runs them (safety-checked) -> synthesizes an answer.
+# ============================================================
 def ask_question(question):
     planning_prompt = f"""You are a senior data analyst. Given this database schema:
 {schema_info}
@@ -218,7 +241,6 @@ Example format: ["SELECT ...", "SELECT ..."]
     plan_response = client.models.generate_content(model="gemini-3.6-flash", contents=planning_prompt)
     plan_text = plan_response.text.strip().replace("```json", "").replace("```", "").strip()
 
-    import json
     try:
         queries = json.loads(plan_text)
     except Exception:
@@ -226,6 +248,9 @@ Example format: ["SELECT ...", "SELECT ..."]
 
     all_results = []
     for q in queries:
+        if not is_safe_sql(q):
+            all_results.append((q, "Blocked: only SELECT queries are allowed for safety."))
+            continue
         try:
             res = pd.read_sql_query(q, conn)
             all_results.append((q, res))
@@ -247,14 +272,20 @@ Write a clear, business-focused answer. If the question is strategic, give 2-3 s
     return queries, all_results, final_response.text.strip()
 
 
-# ---------- Load Data ----------
+# ============================================================
+# SECTION 5: LOAD MAIN DATASET (Instacart)
+# ============================================================
 df = pd.read_sql_query("SELECT * FROM order_products_full", conn)
 
-# ---------- Header ----------
+# ============================================================
+# SECTION 6: HEADER
+# ============================================================
 st.title("🛒 AI-Powered Retail Insight Agent")
 st.write("Statistical + AI-driven analytics on Instacart data")
 
-# ---------- KPIs ----------
+# ============================================================
+# SECTION 7: KPIs
+# ============================================================
 col1, col2, col3 = st.columns(3)
 with col1:
     st.metric("Total Orders", f"{df['order_id'].nunique():,}")
@@ -264,7 +295,9 @@ with col3:
     reorder_rate = df['reordered'].mean() * 100
     st.metric("Overall Reorder Rate", f"{reorder_rate:.1f}%")
 
-# ---------- Charts ----------
+# ============================================================
+# SECTION 8: CHARTS (department insights)
+# ============================================================
 st.divider()
 st.subheader("📊 Department Insights")
 
@@ -283,7 +316,9 @@ with col2:
                    title="Top 10 Departments by Reorder Rate")
     st.plotly_chart(fig2, use_container_width=True)
 
-# ---------- AI Chat ----------
+# ============================================================
+# SECTION 9: AI CHAT (main Instacart dataset)
+# ============================================================
 st.divider()
 st.subheader("💬 Ask the Data (AI-Powered)")
 
@@ -303,7 +338,9 @@ if st.button("Ask") and user_question:
             else:
                 st.write(res)
 
-# ---------- Sidebar ----------
+# ============================================================
+# SECTION 10: SIDEBAR
+# ============================================================
 with st.sidebar:
     st.markdown("### About")
     st.write("Built by Bhaskar — AI-powered retail analytics")
@@ -312,7 +349,7 @@ with st.sidebar:
     st.markdown("🔗 [LinkedIn](https://linkedin.com/in/bhaskarstackanalyst)")
 
 # ============================================================
-# SECTION: Upload Your Own Data
+# SECTION 11: UPLOAD YOUR OWN DATA (multi-table, chain-join)
 # ============================================================
 st.divider()
 st.header("📁 Upload Your Own Data")
@@ -321,6 +358,7 @@ st.write("Upload one or more CSVs — join them, visualize, and ask AI questions
 uploaded_files = st.file_uploader("Choose CSV file(s)", type="csv", accept_multiple_files=True)
 
 if uploaded_files:
+    # ---- 11a: Load each uploaded file into a table dict ----
     tables = {}
     for f in uploaded_files:
         table_name = f.name.replace(".csv", "")
@@ -335,6 +373,7 @@ if uploaded_files:
 
     working_df = None
 
+    # ---- 11b: Single table vs multi-table chain join ----
     if len(tables) == 1:
         working_df = list(tables.values())[0]
         st.info("Only one table uploaded — using it directly.")
@@ -363,11 +402,14 @@ if uploaded_files:
                     current_cols = step["result_cols"]
 
             with col2:
-                left_key = st.selectbox("Column from current data", current_cols, key=f"left_key_{len(st.session_state['join_steps'])}")
+                left_key = st.selectbox("Column from current data", current_cols,
+                                         key=f"left_key_{len(st.session_state['join_steps'])}")
             with col3:
-                right_key = st.selectbox(f"Column from {next_table}", tables[next_table].columns.tolist(), key=f"right_key_{len(st.session_state['join_steps'])}")
+                right_key = st.selectbox(f"Column from {next_table}", tables[next_table].columns.tolist(),
+                                          key=f"right_key_{len(st.session_state['join_steps'])}")
 
-            join_type = st.selectbox("Join type", ["left", "inner", "right", "outer"], index=0, key=f"join_type_{len(st.session_state['join_steps'])}")
+            join_type = st.selectbox("Join type", ["left", "inner", "right", "outer"], index=0,
+                                      key=f"join_type_{len(st.session_state['join_steps'])}")
 
             if st.button("➕ Add This Join"):
                 st.session_state["join_steps"].append({
@@ -379,6 +421,7 @@ if uploaded_files:
                 })
                 st.rerun()
 
+        # ---- 11c: Compute the chained join result ----
         working_df = tables[base_table].copy()
         for i, step in enumerate(st.session_state["join_steps"]):
             try:
@@ -395,7 +438,8 @@ if uploaded_files:
                 break
 
         if st.session_state["join_steps"] and working_df is not None:
-            st.success(f"Joined {len(st.session_state['join_steps'])+1} tables → {len(working_df):,} rows, {len(working_df.columns)} columns.")
+            st.success(f"Joined {len(st.session_state['join_steps'])+1} tables → "
+                       f"{len(working_df):,} rows, {len(working_df.columns)} columns.")
             with st.expander("Preview joined data"):
                 st.dataframe(working_df.head(10))
 
@@ -406,9 +450,10 @@ if uploaded_files:
             st.info("Add at least one join above to combine tables.")
             working_df = None
 
-    # ---------- Only proceed if we have working_df ----------
+    # ---- 11d: Visualization + AI chat on working_df ----
     if working_df is not None:
 
+        # -- Column selection & auto charts --
         st.subheader("📊 Choose up to 4 columns to visualize")
         selected_cols = st.multiselect(
             "Select columns",
@@ -440,6 +485,7 @@ In 1-2 short sentences, explain what this data likely represents and one notable
                 insight = client.models.generate_content(model="gemini-3.6-flash", contents=explain_prompt)
                 st.info(f"💡 {insight.text.strip()}")
 
+        # -- AI chat on the uploaded/joined data --
         st.divider()
         st.subheader("💬 Ask AI About This Data")
 
@@ -462,18 +508,21 @@ Return ONLY a valid SQLite query to answer this. No markdown, no explanation."""
                 plan_resp = client.models.generate_content(model="gemini-3.6-flash", contents=plan_prompt)
                 sql_q = plan_resp.text.strip().replace("```sql", "").replace("```", "").strip()
 
-                try:
-                    result_df = pd.read_sql_query(sql_q, user_conn)
-                    explain_prompt2 = f"""The user asked: "{user_question_upload}"
+                if not is_safe_sql(sql_q):
+                    st.error("Generated query was blocked for safety reasons (only SELECT queries are allowed).")
+                else:
+                    try:
+                        result_df = pd.read_sql_query(sql_q, user_conn)
+                        explain_prompt2 = f"""The user asked: "{user_question_upload}"
 Result:
 {result_df.to_string(index=False)}
 
 Answer in one clear, business-friendly sentence with specific numbers. Do not mention SQL."""
-                    final_ans = client.models.generate_content(model="gemini-3.6-flash", contents=explain_prompt2)
+                        final_ans = client.models.generate_content(model="gemini-3.6-flash", contents=explain_prompt2)
 
-                    st.markdown(f"**💡 Answer:** {final_ans.text.strip()}")
-                    with st.expander("See query and raw result"):
-                        st.code(sql_q, language="sql")
-                        st.dataframe(result_df)
-                except Exception as e:
-                    st.error(f"Couldn't process that question: {e}")
+                        st.markdown(f"**💡 Answer:** {final_ans.text.strip()}")
+                        with st.expander("See query and raw result"):
+                            st.code(sql_q, language="sql")
+                            st.dataframe(result_df)
+                    except Exception as e:
+                        st.error(f"Couldn't process that question: {e}")
