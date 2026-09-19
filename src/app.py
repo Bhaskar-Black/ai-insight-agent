@@ -206,26 +206,20 @@ Tables:
 
 # ============================================================
 # SECTION 3: SQL SAFETY GUARD
-# Blocks any AI-generated SQL that isn't a plain SELECT query.
 # ============================================================
 def is_safe_sql(query):
-    """Only allow SELECT statements - block anything that modifies data."""
     normalized = query.strip().upper()
-
     if not normalized.startswith("SELECT"):
         return False
-
     dangerous_keywords = ["DROP", "DELETE", "INSERT", "UPDATE", "ALTER",
                            "TRUNCATE", "CREATE", "GRANT", "REVOKE", "EXEC", "EXECUTE"]
     for keyword in dangerous_keywords:
         if keyword in normalized:
             return False
-
     return True
 
 # ============================================================
-# SECTION 4: AI QUERY FUNCTION (for the main Instacart dataset)
-# Plans queries -> runs them (safety-checked) -> synthesizes an answer.
+# SECTION 4: AI HELPER FUNCTIONS
 # ============================================================
 def ask_question(question):
     planning_prompt = f"""You are a senior data analyst. Given this database schema:
@@ -272,10 +266,27 @@ Write a clear, business-focused answer. If the question is strategic, give 2-3 s
     return queries, all_results, final_response.text.strip()
 
 
+@st.cache_data(show_spinner=False)
+def get_column_insight(col_name, dtype, sample_values, stats):
+    explain_prompt = f"""Column name: {col_name}
+Data type: {dtype}
+Sample values: {sample_values}
+Basic stats: {stats}
+
+In 1-2 short sentences, explain what this data likely represents and one notable pattern in it. Be concise and business-friendly."""
+
+    insight = client.models.generate_content(model="gemini-3.6-flash", contents=explain_prompt)
+    return insight.text.strip()
+
+
 # ============================================================
-# SECTION 5: LOAD MAIN DATASET (Instacart)
+# SECTION 5: LOAD MAIN DATASET (Instacart) — cached for 1 hour
 # ============================================================
-df = pd.read_sql_query("SELECT * FROM order_products_full", conn)
+@st.cache_data(ttl=3600)
+def load_main_data():
+    return pd.read_sql_query("SELECT * FROM order_products_full", conn)
+
+df = load_main_data()
 
 # ============================================================
 # SECTION 6: HEADER
@@ -358,7 +369,6 @@ st.write("Upload one or more CSVs — join them, visualize, and ask AI questions
 uploaded_files = st.file_uploader("Choose CSV file(s)", type="csv", accept_multiple_files=True)
 
 if uploaded_files:
-    # ---- 11a: Load each uploaded file into a table dict ----
     tables = {}
     for f in uploaded_files:
         table_name = f.name.replace(".csv", "")
@@ -373,7 +383,6 @@ if uploaded_files:
 
     working_df = None
 
-    # ---- 11b: Single table vs multi-table chain join ----
     if len(tables) == 1:
         working_df = list(tables.values())[0]
         st.info("Only one table uploaded — using it directly.")
@@ -421,7 +430,6 @@ if uploaded_files:
                 })
                 st.rerun()
 
-        # ---- 11c: Compute the chained join result ----
         working_df = tables[base_table].copy()
         for i, step in enumerate(st.session_state["join_steps"]):
             try:
@@ -450,10 +458,8 @@ if uploaded_files:
             st.info("Add at least one join above to combine tables.")
             working_df = None
 
-    # ---- 11d: Visualization + AI chat on working_df ----
     if working_df is not None:
 
-        # -- Column selection & auto charts --
         st.subheader("📊 Choose up to 4 columns to visualize")
         selected_cols = st.multiselect(
             "Select columns",
@@ -475,17 +481,14 @@ if uploaded_files:
 
                 st.plotly_chart(fig, use_container_width=True)
 
-                explain_prompt = f"""Column name: {col}
-Data type: {working_df[col].dtype}
-Sample values: {working_df[col].dropna().head(5).tolist()}
-Basic stats: {working_df[col].describe().to_dict()}
+                insight_text = get_column_insight(
+                    col,
+                    str(working_df[col].dtype),
+                    working_df[col].dropna().head(5).tolist(),
+                    working_df[col].describe().to_dict()
+                )
+                st.info(f"💡 {insight_text}")
 
-In 1-2 short sentences, explain what this data likely represents and one notable pattern in it. Be concise and business-friendly."""
-
-                insight = client.models.generate_content(model="gemini-3.6-flash", contents=explain_prompt)
-                st.info(f"💡 {insight.text.strip()}")
-
-        # -- AI chat on the uploaded/joined data --
         st.divider()
         st.subheader("💬 Ask AI About This Data")
 
