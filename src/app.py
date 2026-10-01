@@ -1,12 +1,14 @@
 import streamlit as st
 import pandas as pd
 import os
+import time
 from dotenv import load_dotenv
 from google import genai
 from sqlalchemy import create_engine
 import plotly.express as px
 import sqlite3
 import json
+import pdfplumber
 
 # ============================================================
 # SECTION 1: PAGE SETUP
@@ -221,7 +223,24 @@ def is_safe_sql(query):
 # ============================================================
 # SECTION 4: AI HELPER FUNCTIONS
 # ============================================================
+
+def safe_ai_call(prompt, model="gemini-3.6-flash", retries=2):
+    """Calls Gemini with retry on temporary overload (503)."""
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            return client.models.generate_content(model=model, contents=prompt)
+        except Exception as e:
+            last_error = e
+            if "503" in str(e) or "UNAVAILABLE" in str(e):
+                if attempt < retries:
+                    time.sleep(2 * (attempt + 1))
+                    continue
+            raise Exception(f"AI service error: {last_error}")
+
+
 def ask_question(question):
+    """Main Instacart dataset: plan queries -> run (safety-checked) -> synthesize answer."""
     planning_prompt = f"""You are a senior data analyst. Given this database schema:
 {schema_info}
 
@@ -232,8 +251,11 @@ Decide what SQL queries are needed to answer this well. Simple factual questions
 Return ONLY a JSON list of SQL queries needed, nothing else. No markdown, no explanation.
 Example format: ["SELECT ...", "SELECT ..."]
 """
-    plan_response = client.models.generate_content(model="gemini-3.6-flash", contents=planning_prompt)
-    plan_text = plan_response.text.strip().replace("```json", "").replace("```", "").strip()
+    try:
+        plan_response = safe_ai_call(planning_prompt)
+        plan_text = plan_response.text.strip().replace("```json", "").replace("```", "").strip()
+    except Exception as e:
+        return [], [], f"⚠️ Couldn't reach the AI service right now. Please try again in a moment."
 
     try:
         queries = json.loads(plan_text)
@@ -262,8 +284,11 @@ Here is the data gathered to answer this:
 
 Write a clear, business-focused answer. If the question is strategic, give 2-3 specific, data-backed recommendations, not just raw numbers. If it's a simple factual question, answer in one direct sentence. Do not mention SQL or databases."""
 
-    final_response = client.models.generate_content(model="gemini-3.6-flash", contents=final_prompt)
-    return queries, all_results, final_response.text.strip()
+    try:
+        final_response = safe_ai_call(final_prompt)
+        return queries, all_results, final_response.text.strip()
+    except Exception as e:
+        return queries, all_results, "⚠️ Got the data but couldn't generate the final answer right now. Try again shortly."
 
 
 @st.cache_data(show_spinner=False)
@@ -275,8 +300,11 @@ Basic stats: {stats}
 
 In 1-2 short sentences, explain what this data likely represents and one notable pattern in it. Be concise and business-friendly."""
 
-    insight = client.models.generate_content(model="gemini-3.6-flash", contents=explain_prompt)
-    return insight.text.strip()
+    try:
+        insight = safe_ai_call(explain_prompt)
+        return insight.text.strip()
+    except Exception as e:
+        return "⚠️ AI insight unavailable right now."
 
 
 # ============================================================
@@ -284,7 +312,11 @@ In 1-2 short sentences, explain what this data likely represents and one notable
 # ============================================================
 @st.cache_data(ttl=3600)
 def load_main_data():
-    return pd.read_sql_query("SELECT * FROM order_products_full", conn)
+    try:
+        return pd.read_sql_query("SELECT * FROM order_products_full", conn)
+    except Exception as e:
+        st.error("⚠️ Couldn't connect to the database. Please try again later.")
+        st.stop()
 
 df = load_main_data()
 
@@ -360,19 +392,56 @@ with st.sidebar:
     st.markdown("🔗 [LinkedIn](https://linkedin.com/in/bhaskarstackanalyst)")
 
 # ============================================================
-# SECTION 11: UPLOAD YOUR OWN DATA (multi-table, chain-join)
+# SECTION 11: UPLOAD YOUR OWN DATA (multi-table, chain-join, chart builder)
 # ============================================================
 st.divider()
 st.header("📁 Upload Your Own Data")
-st.write("Upload one or more CSVs — join them, visualize, and ask AI questions.")
+st.write("Upload one or more files (CSV, Excel, or PDF) — join them, visualize, and ask AI questions.")
 
-uploaded_files = st.file_uploader("Choose CSV file(s)", type="csv", accept_multiple_files=True)
+uploaded_files = st.file_uploader(
+    "Choose file(s) — CSV, Excel, or PDF",
+    type=["csv", "xlsx", "xls", "pdf"],
+    accept_multiple_files=True
+)
 
 if uploaded_files:
+    # ---- 11a: Load each uploaded file into a table dict ----
     tables = {}
     for f in uploaded_files:
-        table_name = f.name.replace(".csv", "")
-        tables[table_name] = pd.read_csv(f)
+        file_ext = f.name.split(".")[-1].lower()
+        base_name = f.name.rsplit(".", 1)[0]
+
+        try:
+            if file_ext == "csv":
+                tables[base_name] = pd.read_csv(f)
+
+            elif file_ext in ["xlsx", "xls"]:
+                excel_data = pd.read_excel(f, sheet_name=None)
+                if len(excel_data) == 1:
+                    tables[base_name] = list(excel_data.values())[0]
+                else:
+                    for sheet_name, sheet_df in excel_data.items():
+                        tables[f"{base_name}_{sheet_name}"] = sheet_df
+
+            elif file_ext == "pdf":
+                with pdfplumber.open(f) as pdf:
+                    pdf_tables_found = 0
+                    for page_num, page in enumerate(pdf.pages):
+                        page_tables = page.extract_tables()
+                        for t_idx, raw_table in enumerate(page_tables):
+                            if raw_table and len(raw_table) > 1:
+                                pdf_df = pd.DataFrame(raw_table[1:], columns=raw_table[0])
+                                table_key = f"{base_name}_p{page_num+1}_t{t_idx+1}"
+                                tables[table_key] = pdf_df
+                                pdf_tables_found += 1
+                    if pdf_tables_found == 0:
+                        st.warning(f"⚠️ No tables detected in '{f.name}'. PDF extraction works best on simple, clearly-bordered tables.")
+
+        except Exception as e:
+            st.error(f"⚠️ Couldn't read '{f.name}': {e}")
+
+    if not tables:
+        st.stop()
 
     st.success(f"Loaded {len(tables)} table(s): {', '.join(tables.keys())}")
 
@@ -383,6 +452,7 @@ if uploaded_files:
 
     working_df = None
 
+    # ---- 11b: Single table vs multi-table chain join ----
     if len(tables) == 1:
         working_df = list(tables.values())[0]
         st.info("Only one table uploaded — using it directly.")
@@ -430,6 +500,7 @@ if uploaded_files:
                 })
                 st.rerun()
 
+        # ---- 11c: Compute the chained join result ----
         working_df = tables[base_table].copy()
         for i, step in enumerate(st.session_state["join_steps"]):
             try:
@@ -458,6 +529,7 @@ if uploaded_files:
             st.info("Add at least one join above to combine tables.")
             working_df = None
 
+    # ---- 11d: Column selection + custom chart builder ----
     if working_df is not None:
 
         st.subheader("📊 Choose up to 4 columns to visualize")
@@ -469,26 +541,82 @@ if uploaded_files:
         )
 
         if selected_cols:
-            for col in selected_cols:
-                st.markdown(f"#### {col}")
+            st.markdown("#### 🎨 Build Your Chart")
+            st.write("Choose how you'd like to compare your selected columns.")
 
-                if pd.api.types.is_numeric_dtype(working_df[col]):
-                    fig = px.histogram(working_df, x=col, title=f"Distribution of {col}")
-                else:
-                    value_counts = working_df[col].value_counts().reset_index().head(15)
-                    value_counts.columns = [col, 'count']
-                    fig = px.bar(value_counts, x=col, y='count', title=f"Top values in {col}")
+            chart_type = st.selectbox(
+                "Chart type",
+                ["Bar", "Line", "Scatter", "Pie", "Box Plot"],
+                key="chart_type"
+            )
 
-                st.plotly_chart(fig, use_container_width=True)
+            col_a, col_b, col_c = st.columns(3)
 
-                insight_text = get_column_insight(
-                    col,
-                    str(working_df[col].dtype),
-                    working_df[col].dropna().head(5).tolist(),
-                    working_df[col].describe().to_dict()
-                )
-                st.info(f"💡 {insight_text}")
+            with col_a:
+                x_axis = st.selectbox("X-axis", selected_cols, key="x_axis")
 
+            with col_b:
+                y_options = ["(count)"] + [c for c in selected_cols if c != x_axis]
+                y_axis = st.selectbox("Y-axis", y_options, key="y_axis")
+
+            with col_c:
+                color_options = ["(none)"] + [c for c in selected_cols if c not in [x_axis, y_axis]]
+                color_by = st.selectbox("Group/Color by (optional)", color_options, key="color_by")
+
+            color_arg = None if color_by == "(none)" else color_by
+            fig = None
+
+            try:
+                if chart_type == "Bar":
+                    if y_axis == "(count)":
+                        plot_data = working_df.groupby(x_axis).size().reset_index(name="count")
+                        fig = px.bar(plot_data, x=x_axis, y="count", title=f"Count by {x_axis}")
+                    else:
+                        fig = px.bar(working_df, x=x_axis, y=y_axis, color=color_arg,
+                                     title=f"{y_axis} by {x_axis}")
+
+                elif chart_type == "Line":
+                    if y_axis == "(count)":
+                        plot_data = working_df.groupby(x_axis).size().reset_index(name="count")
+                        fig = px.line(plot_data, x=x_axis, y="count", title=f"Count by {x_axis}")
+                    else:
+                        fig = px.line(working_df, x=x_axis, y=y_axis, color=color_arg,
+                                      title=f"{y_axis} over {x_axis}")
+
+                elif chart_type == "Scatter":
+                    if y_axis == "(count)":
+                        st.warning("Scatter plot needs a numeric Y-axis, not count. Pick another column for Y-axis.")
+                    else:
+                        fig = px.scatter(working_df, x=x_axis, y=y_axis, color=color_arg,
+                                         title=f"{y_axis} vs {x_axis}")
+
+                elif chart_type == "Pie":
+                    plot_data = working_df[x_axis].value_counts().reset_index().head(10)
+                    plot_data.columns = [x_axis, "count"]
+                    fig = px.pie(plot_data, names=x_axis, values="count", title=f"Distribution of {x_axis}")
+
+                elif chart_type == "Box Plot":
+                    if y_axis == "(count)":
+                        st.warning("Box plot needs a numeric Y-axis. Pick another column for Y-axis.")
+                    else:
+                        fig = px.box(working_df, x=x_axis, y=y_axis, color=color_arg,
+                                    title=f"{y_axis} distribution by {x_axis}")
+
+                if fig:
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    insight_text = get_column_insight(
+                        f"{x_axis} vs {y_axis}",
+                        chart_type,
+                        working_df[x_axis].dropna().head(5).tolist(),
+                        {"chart_type": chart_type, "x": x_axis, "y": y_axis}
+                    )
+                    st.info(f"💡 {insight_text}")
+
+            except Exception as e:
+                st.warning(f"⚠️ Couldn't build this chart: {e}")
+
+        # -- AI chat on the uploaded/joined data --
         st.divider()
         st.subheader("💬 Ask AI About This Data")
 
@@ -508,12 +636,16 @@ The user asked: "{user_question_upload}"
 
 Return ONLY a valid SQLite query to answer this. No markdown, no explanation."""
 
-                plan_resp = client.models.generate_content(model="gemini-3.6-flash", contents=plan_prompt)
-                sql_q = plan_resp.text.strip().replace("```sql", "").replace("```", "").strip()
+                sql_q = None
+                try:
+                    plan_resp = safe_ai_call(plan_prompt)
+                    sql_q = plan_resp.text.strip().replace("```sql", "").replace("```", "").strip()
+                except Exception as e:
+                    st.error("⚠️ Couldn't reach the AI service right now. Please try again in a moment.")
 
-                if not is_safe_sql(sql_q):
+                if sql_q and not is_safe_sql(sql_q):
                     st.error("Generated query was blocked for safety reasons (only SELECT queries are allowed).")
-                else:
+                elif sql_q:
                     try:
                         result_df = pd.read_sql_query(sql_q, user_conn)
                         explain_prompt2 = f"""The user asked: "{user_question_upload}"
@@ -521,7 +653,7 @@ Result:
 {result_df.to_string(index=False)}
 
 Answer in one clear, business-friendly sentence with specific numbers. Do not mention SQL."""
-                        final_ans = client.models.generate_content(model="gemini-3.6-flash", contents=explain_prompt2)
+                        final_ans = safe_ai_call(explain_prompt2)
 
                         st.markdown(f"**💡 Answer:** {final_ans.text.strip()}")
                         with st.expander("See query and raw result"):
