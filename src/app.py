@@ -350,14 +350,14 @@ with col1:
     dept_volume.columns = ['department', 'order_count']
     fig1 = px.bar(dept_volume.head(10), x='department', y='order_count',
                    title="Top 10 Departments by Order Volume")
-    st.plotly_chart(fig1, use_container_width=True)
+    st.plotly_chart(fig1, width="stretch")
 
 with col2:
     reorder_by_dept = df.groupby('department')['reordered'].mean().sort_values(ascending=False).reset_index()
     reorder_by_dept.columns = ['department', 'reorder_rate']
     fig2 = px.bar(reorder_by_dept.head(10), x='department', y='reorder_rate',
                    title="Top 10 Departments by Reorder Rate")
-    st.plotly_chart(fig2, use_container_width=True)
+    st.plotly_chart(fig2, width="stretch")
 
 # ============================================================
 # SECTION 9: AI CHAT (main Instacart dataset)
@@ -603,7 +603,7 @@ if uploaded_files:
                                     title=f"{y_axis} distribution by {x_axis}")
 
                 if fig:
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
 
                     insight_text = get_column_insight(
                         f"{x_axis} vs {y_axis}",
