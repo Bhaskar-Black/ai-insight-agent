@@ -9,6 +9,7 @@ from io import BytesIO
 from xml.sax.saxutils import escape
 from dotenv import load_dotenv
 from google import genai
+from google.genai import types
 from sqlalchemy import create_engine
 import plotly.express as px
 import pdfplumber
@@ -17,6 +18,9 @@ from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
+_SCRIPT_START = time.time()
+PERF = {}   # step -> seconds (sidebar ke 'Performance' panel mein dikhta hai)
 
 # ============================================================
 # FILE MAP (kaunsa section kya karta hai)
@@ -31,6 +35,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 #   SECTION 9  : Sidebar
 #   SECTION 10 : Page: upload -> join -> chart -> AI chat -> report
 #   SECTION 11 : Page: AI chat on default Instacart data
+#   SECTION 12 : Deferred AI chart insight + performance panel
 # ============================================================
 
 # ============================================================
@@ -44,16 +49,9 @@ st.markdown("""
 
 * { font-family: 'Space Grotesk', sans-serif; }
 
-/* Animated gradient background */
+/* Static gradient background (fast). Animation is opt-in from the sidebar toggle. */
 .stApp {
-    background: linear-gradient(-45deg, #0a0e27, #1e0a3c, #0a1e3c, #1a0a2e);
-    background-size: 400% 400%;
-    animation: gradientShift 20s ease infinite;
-}
-@keyframes gradientShift {
-    0% { background-position: 0% 50%; }
-    50% { background-position: 100% 50%; }
-    100% { background-position: 0% 50%; }
+    background: linear-gradient(135deg, #0a0e27 0%, #1e0a3c 50%, #0a1e3c 100%);
 }
 
 /* Static glow orbs (no blur filter / no animation = much lighter on the browser) */
@@ -78,13 +76,10 @@ st.markdown("""
 }
 
 h1 {
-    background: linear-gradient(90deg, #a78bfa, #60a5fa, #a78bfa);
-    background-size: 200% auto;
+    background: linear-gradient(90deg, #a78bfa, #60a5fa);
     -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-    animation: shine 4s linear infinite;
     font-weight: 800 !important; font-size: 3rem !important;
 }
-@keyframes shine { to { background-position: 200% center; } }
 
 h2, h3, h4 { color: #c4b5fd !important; font-weight: 700 !important; }
 p, .stMarkdown { color: #cbd5e1; }
@@ -147,6 +142,28 @@ hr {
 [data-testid="stDataFrame"] {
     border: 1px solid rgba(139, 92, 246, 0.2); border-radius: 10px;
 }
+</style>
+""", unsafe_allow_html=True)
+
+with st.sidebar:
+    animated_bg = st.toggle("✨ Animated background", value=False,
+                            help="Looks cooler but keeps the CPU busy. Leave it off on slower computers.")
+if animated_bg:
+    st.markdown("""
+<style>
+.stApp {
+    background: linear-gradient(-45deg, #0a0e27, #1e0a3c, #0a1e3c, #1a0a2e);
+    background-size: 400% 400%;
+    animation: gradientShift 20s ease infinite;
+}
+@keyframes gradientShift {
+    0% { background-position: 0% 50%; }
+    50% { background-position: 100% 50%; }
+    100% { background-position: 0% 50%; }
+}
+h1 { background: linear-gradient(90deg, #a78bfa, #60a5fa, #a78bfa); background-size: 200% auto;
+     -webkit-background-clip: text; -webkit-text-fill-color: transparent; animation: shine 4s linear infinite; }
+@keyframes shine { to { background-position: 200% center; } }
 </style>
 """, unsafe_allow_html=True)
 
@@ -224,16 +241,47 @@ def is_safe_sql(query):
 # ============================================================
 # SECTION 4: AI HELPERS
 # ============================================================
+@st.cache_resource
+def _ai_flags():
+    return {"fast_ok": True}
+
+
+def _is_transient(e):
+    return any(code in str(e) for code in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"))
+
+
+def _fast_config():
+    # Gemini ko kam "thinking" karne ko kehta hai (is app ke tasks simple hain) -> calls kaafi tez
+    return types.GenerateContentConfig(
+        thinking_config=types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW),
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+    )
+
+
+def _generate(prompt, model):
+    flags = _ai_flags()
+    if flags["fast_ok"]:
+        try:
+            return client.models.generate_content(model=model, contents=prompt, config=_fast_config())
+        except Exception as e:
+            if _is_transient(e):
+                raise
+            # shayad ye model/SDK yeh setting nahi leta: plain call try karo, chal gaya to yaad rakho
+            result = client.models.generate_content(model=model, contents=prompt)
+            flags["fast_ok"] = False
+            return result
+    return client.models.generate_content(model=model, contents=prompt)
+
+
 def safe_ai_call(prompt, model=MODEL_NAME, retries=2):
-    """Gemini call with automatic retry on temporary overload / rate-limit."""
+    """Gemini call: fast config + automatic retry on temporary overload / rate-limit."""
     last_error = None
     for attempt in range(retries + 1):
         try:
-            return client.models.generate_content(model=model, contents=prompt)
+            return _generate(prompt, model)
         except Exception as e:
             last_error = e
-            transient = any(code in str(e) for code in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"))
-            if transient and attempt < retries:
+            if _is_transient(e) and attempt < retries:
                 time.sleep(2 * (attempt + 1))
                 continue
             raise Exception(f"AI service error: {last_error}")
@@ -273,7 +321,9 @@ def run_ai_query(question, query_conn, schema_description, dialect="SQLite"):
     """
     UNIFIED query engine (default Instacart DB aur uploaded data dono ke liye).
     Plan queries -> safety check -> run -> synthesize final answer.
+    Returns (queries, results, answer, timings).
     """
+    timings = {}
     planning_prompt = f"""You are a senior data analyst. Given this database schema:
 {schema_description}
 
@@ -286,10 +336,12 @@ Only use tables and columns that exist in the schema above.
 Return ONLY a JSON list of SQL query strings, nothing else. No markdown, no explanation.
 Example format: ["SELECT ...", "SELECT ..."]
 """
+    t = time.time()
     try:
         plan_text = safe_ai_call(planning_prompt).text
     except Exception:
-        return [], [], "⚠️ Couldn't reach the AI service right now. Please try again in a moment."
+        return [], [], "⚠️ Couldn't reach the AI service right now. Please try again in a moment.", timings
+    timings["AI planning"] = time.time() - t
 
     try:
         queries = parse_json_loose(plan_text)
@@ -299,6 +351,7 @@ Example format: ["SELECT ...", "SELECT ..."]
     except Exception:
         queries = [plan_text.strip().replace("```sql", "").replace("```", "").strip()]
 
+    t = time.time()
     all_results = []
     for q in queries:
         if not is_safe_sql(q):
@@ -308,6 +361,7 @@ Example format: ["SELECT ...", "SELECT ..."]
             all_results.append((q, pd.read_sql_query(q, query_conn)))
         except Exception as e:
             all_results.append((q, f"Error: {e}"))
+    timings["database"] = time.time() - t
 
     combined_data = ""
     for q, res in all_results:
@@ -322,10 +376,13 @@ Here is the data gathered to answer this:
 Write a clear, business-focused answer using only the numbers shown above. If the question is strategic,
 give 2-3 specific, data-backed recommendations. If it's a simple factual question, answer in one direct sentence.
 Do not mention SQL or databases."""
+    t = time.time()
     try:
-        return queries, all_results, safe_ai_call(final_prompt).text.strip()
+        answer = safe_ai_call(final_prompt).text.strip()
     except Exception:
-        return queries, all_results, "⚠️ Got the data but couldn't write the final answer right now. Try again shortly."
+        answer = "⚠️ Got the data but couldn't write the final answer right now. Try again shortly."
+    timings["AI answer"] = time.time() - t
+    return queries, all_results, answer, timings
 
 
 # NOTE: Cached functions neeche jaan-bhoojh ke failure par EXCEPTION raise karte hain
@@ -370,11 +427,22 @@ Return ONLY valid JSON: {{"chart_type": "...", "x": "...", "y": "...", "color_by
     raise ValueError("Unusable chart recommendation")
 
 
-def recommend_chart(working_df, candidate_cols):
+@st.cache_data(show_spinner=False, max_entries=50)
+def cached_col_profiles_json(data_key, cols, _df):
+    """Column profile ek baar compute hota hai (nunique 5 lakh rows par har click pe nahi chalta)."""
+    return json.dumps(build_col_profiles(_df, list(cols)), default=str)
+
+
+@st.cache_data(show_spinner=False, max_entries=30)
+def cached_unique_values(data_key, col, _df):
+    values = _df[col].dropna().unique()
+    return len(values), values[:5000].tolist()
+
+
+def recommend_chart(working_df, candidate_cols, data_key):
     """AI chart recommendation (cached). AI fail ho to simple heuristic fallback."""
-    profiles = build_col_profiles(working_df, candidate_cols)
     try:
-        return _recommend_chart_cached(json.dumps(profiles, default=str))
+        return _recommend_chart_cached(cached_col_profiles_json(data_key, tuple(candidate_cols), working_df))
     except Exception:
         pass
     numeric_cols = [c for c in candidate_cols
@@ -415,7 +483,7 @@ def coerce_numeric_columns(df):
 
 
 @st.cache_resource(show_spinner="Reading your file...", max_entries=4)
-def parse_uploaded_file(file_name, file_bytes):
+def parse_uploaded_file(file_id, file_name, _file_bytes):
     """File ek baar parse hoti hai aur cache ho jaati hai (har rerun pe dobara nahi padhi jaati)."""
     ext = file_name.rsplit(".", 1)[-1].lower()
     base = file_name.rsplit(".", 1)[0]
@@ -423,12 +491,12 @@ def parse_uploaded_file(file_name, file_bytes):
 
     if ext == "csv":
         try:
-            tables[base] = pd.read_csv(BytesIO(file_bytes))
+            tables[base] = pd.read_csv(BytesIO(_file_bytes))
         except UnicodeDecodeError:
-            tables[base] = pd.read_csv(BytesIO(file_bytes), encoding="latin-1")
+            tables[base] = pd.read_csv(BytesIO(_file_bytes), encoding="latin-1")
 
     elif ext in ("xlsx", "xls"):
-        sheets = pd.read_excel(BytesIO(file_bytes), sheet_name=None)
+        sheets = pd.read_excel(BytesIO(_file_bytes), sheet_name=None)
         if len(sheets) == 1:
             tables[base] = next(iter(sheets.values()))
         else:
@@ -437,7 +505,7 @@ def parse_uploaded_file(file_name, file_bytes):
 
     elif ext == "pdf":
         found = 0
-        with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+        with pdfplumber.open(BytesIO(_file_bytes)) as pdf:
             for page_num, page in enumerate(pdf.pages):
                 for t_idx, raw in enumerate(page.extract_tables()):
                     if raw and len(raw) > 1:
@@ -799,8 +867,11 @@ def render_chart(working_df, chart_type, x_axis, y_axis, color_arg):
     return fig, facts
 
 
-def show_answer(answer, all_results):
+def show_answer(answer, all_results, timings=None):
     st.markdown(f"**💡 Answer:** {md_safe(answer)}")
+    if timings:
+        st.caption("⏱ " + " · ".join(f"{k} {v:.1f}s" for k, v in timings.items())
+                   + f" · total {sum(timings.values()):.1f}s")
     with st.expander("See analysis details"):
         for q, res in all_results:
             st.code(q, language="sql")
@@ -834,10 +905,12 @@ st.write("Statistical + AI-driven analytics on Instacart data")
 
 dashboard = None
 if main_conn is not None:
+    _t_dash = time.time()
     try:
         dashboard = load_dashboard_stats(main_conn)
     except Exception:
         dashboard = None
+    PERF["dashboard data (cached 1h)"] = time.time() - _t_dash
 
 if dashboard is not None:
     kpis, dept_stats = dashboard
@@ -879,6 +952,8 @@ st.header("📁 Upload Your Own Data")
 st.write("Upload one or more files (CSV, Excel, or PDF) — join them, visualize, ask AI questions, and export a report.")
 
 working_df = None  # active uploaded / joined dataframe
+pending_insight = None  # AI chart insight page ke END mein fill hota hai (UI pehle dikh jaata hai)
+insight_slot = None
 
 uploaded_files = st.file_uploader("Choose file(s) — CSV, Excel, or PDF",
                                   type=["csv", "xlsx", "xls", "pdf"], accept_multiple_files=True)
@@ -890,14 +965,18 @@ if uploaded_files:
 
     # ---- 10b: parse files (cached) ----
     tables = {}
+    _t_parse = time.time()
     for f in uploaded_files:
         try:
-            file_tables, notes = parse_uploaded_file(f.name, f.getvalue())
+            fid = getattr(f, "file_id", None) or f"{f.name}-{f.size}"
+            file_tables, notes = parse_uploaded_file(fid, f.name, f.getvalue())
             tables.update(file_tables)
             for note in notes:
                 st.warning(note)
         except Exception as e:
             st.error(f"⚠️ Couldn't read '{f.name}': {e}")
+
+    PERF["file parse (cached after 1st)"] = time.time() - _t_parse
 
     if not tables:
         st.stop()
@@ -988,8 +1067,10 @@ if uploaded_files:
         if selected_cols:
             ck = f"{wk}_{abs(hash(tuple(selected_cols))) % 10**6}"
             st.markdown("#### 🤖 AI-Recommended Chart")
+            _t_rec = time.time()
             with st.spinner("Picking the best chart for this data..."):
-                recommendation = recommend_chart(working_df, selected_cols)
+                recommendation = recommend_chart(working_df, selected_cols, data_key)
+            PERF["chart recommendation (AI; cached after 1st)"] = time.time() - _t_rec
 
             use_recommended = st.toggle("Use AI recommendation", value=True, key="use_ai_chart")
 
@@ -1017,10 +1098,10 @@ if uploaded_files:
                 color_arg = None if color_by == "(none)" else color_by
 
             # X-axis mein bahut saari unique values hon to user khud choose kare kin ko compare karna hai
-            unique_vals = working_df[x_axis].dropna().unique().tolist()
-            if len(unique_vals) > 15 and chart_type in ["Bar", "Pie", "Box Plot"]:
-                st.write(f"'{x_axis}' has {len(unique_vals):,} unique values — pick specific ones to compare:")
-                chosen = st.multiselect(f"Select values of {x_axis} to compare", options=unique_vals[:5000],
+            unique_count, unique_vals = cached_unique_values(data_key, x_axis, working_df)
+            if unique_count > 15 and chart_type in ["Bar", "Pie", "Box Plot"]:
+                st.write(f"'{x_axis}' has {unique_count:,} unique values — pick specific ones to compare:")
+                chosen = st.multiselect(f"Select values of {x_axis} to compare", options=unique_vals,
                                         default=unique_vals[:5], key=f"entity_filter_{ck}_{abs(hash(x_axis)) % 10**6}")
                 chart_df = working_df[working_df[x_axis].isin(chosen)] if chosen else working_df.head(0)
                 if not chosen:
@@ -1032,11 +1113,8 @@ if uploaded_files:
                 fig, facts = render_chart(chart_df, chart_type, x_axis, y_axis, color_arg)
                 if fig:
                     st.plotly_chart(fig, width="stretch")
-                    try:
-                        insight = get_chart_insight(f"{y_axis} by {x_axis}", chart_type, facts)
-                    except Exception:
-                        insight = "AI insight unavailable right now — try again in a moment."
-                    st.info(f"💡 {md_safe(insight)}")
+                    insight_slot = st.empty()
+                    pending_insight = (f"{y_axis} by {x_axis}", chart_type, facts)
 
         # ---- 10e: AI chat on uploaded data ----
         st.divider()
@@ -1047,9 +1125,9 @@ if uploaded_files:
             with st.spinner("Analyzing..."):
                 try:
                     upload_conn = get_upload_connection(data_key, working_df)
-                    queries, all_results, answer = run_ai_query(upload_question, upload_conn,
-                                                                describe_schema(working_df), dialect="SQLite")
-                    show_answer(answer, all_results)
+                    queries, all_results, answer, timings = run_ai_query(
+                        upload_question, upload_conn, describe_schema(working_df), dialect="SQLite")
+                    show_answer(answer, all_results, timings)
                 except Exception as e:
                     st.error(f"⚠️ Something went wrong: {e}")
 
@@ -1110,6 +1188,27 @@ if working_df is None:
         default_question = st.text_input("Ask a question about the Instacart data", key="default_question")
         if st.button("Ask", key="default_ask_button") and default_question:
             with st.spinner("Analyzing..."):
-                queries, all_results, answer = run_ai_query(default_question, main_conn, MAIN_SCHEMA,
-                                                            dialect="PostgreSQL")
-            show_answer(answer, all_results)
+                queries, all_results, answer, timings = run_ai_query(
+                    default_question, main_conn, MAIN_SCHEMA, dialect="PostgreSQL")
+            show_answer(answer, all_results, timings)
+
+# ============================================================
+# SECTION 12: DEFERRED AI CHART INSIGHT + PERFORMANCE PANEL
+# Page pehle poora dikh jaata hai; AI insight bad mein chart ke neeche aa jaata hai.
+# ============================================================
+PERF["page ready (before AI insight)"] = time.time() - _SCRIPT_START
+
+if pending_insight and insight_slot is not None:
+    _t_ins = time.time()
+    with insight_slot.container():
+        with st.spinner("AI is reading your chart..."):
+            try:
+                _insight_text = get_chart_insight(*pending_insight)
+            except Exception:
+                _insight_text = "AI insight unavailable right now — try again in a moment."
+        st.info(f"💡 {md_safe(_insight_text)}")
+    PERF["chart insight (AI; cached after 1st)"] = time.time() - _t_ins
+
+with st.sidebar.expander("⚡ Performance (last run)"):
+    for _step, _sec in PERF.items():
+        st.write(f"{_step}: **{_sec:.2f}s**")
