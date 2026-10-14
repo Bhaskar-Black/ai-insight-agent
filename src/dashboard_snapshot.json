@@ -1,0 +1,115 @@
+{
+  "created": "2026-10-13",
+  "kpis": {
+    "total_orders": 90182,
+    "total_products": 22355,
+    "reorder_rate": 0.59849
+  },
+  "departments": [
+    {
+      "department": "alcohol",
+      "order_count": 810,
+      "reorder_rate": 0.6074074074074074
+    },
+    {
+      "department": "babies",
+      "order_count": 2174,
+      "reorder_rate": 0.5331186752529898
+    },
+    {
+      "department": "bakery",
+      "order_count": 6949,
+      "reorder_rate": 0.6334724420779968
+    },
+    {
+      "department": "beverages",
+      "order_count": 16265,
+      "reorder_rate": 0.6579772517675991
+    },
+    {
+      "department": "breakfast",
+      "order_count": 4309,
+      "reorder_rate": 0.5674170341146437
+    },
+    {
+      "department": "bulk",
+      "order_count": 207,
+      "reorder_rate": 0.5217391304347826
+    },
+    {
+      "department": "canned goods",
+      "order_count": 6839,
+      "reorder_rate": 0.48004094165813715
+    },
+    {
+      "department": "dairy eggs",
+      "order_count": 31573,
+      "reorder_rate": 0.6750071263421278
+    },
+    {
+      "department": "deli",
+      "order_count": 6310,
+      "reorder_rate": 0.6155309033280507
+    },
+    {
+      "department": "dry goods pasta",
+      "order_count": 5528,
+      "reorder_rate": 0.48570911722141824
+    },
+    {
+      "department": "frozen",
+      "order_count": 14481,
+      "reorder_rate": 0.5570057316483669
+    },
+    {
+      "department": "household",
+      "order_count": 5157,
+      "reorder_rate": 0.42834981578437076
+    },
+    {
+      "department": "international",
+      "order_count": 1681,
+      "reorder_rate": 0.3801308744794765
+    },
+    {
+      "department": "meat seafood",
+      "order_count": 4379,
+      "reorder_rate": 0.5928294131080155
+    },
+    {
+      "department": "missing",
+      "order_count": 1226,
+      "reorder_rate": 0.3923327895595432
+    },
+    {
+      "department": "other",
+      "order_count": 305,
+      "reorder_rate": 0.3836065573770492
+    },
+    {
+      "department": "pantry",
+      "order_count": 11820,
+      "reorder_rate": 0.37038917089678514
+    },
+    {
+      "department": "personal care",
+      "order_count": 3096,
+      "reorder_rate": 0.330749354005168
+    },
+    {
+      "department": "pets",
+      "order_count": 617,
+      "reorder_rate": 0.6434359805510534
+    },
+    {
+      "department": "produce",
+      "order_count": 59101,
+      "reorder_rate": 0.6659954992301315
+    },
+    {
+      "department": "snacks",
+      "order_count": 17173,
+      "reorder_rate": 0.5798637395912187
+    }
+  ]
+}

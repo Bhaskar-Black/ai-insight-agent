@@ -10,7 +10,7 @@ from xml.sax.saxutils import escape
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 import plotly.express as px
 import pdfplumber
 from openpyxl.styles import Alignment
@@ -177,6 +177,8 @@ MAX_EXCEL_ROWS = 10000         # Excel report ke "Data" sheet mein max rows
 MAX_CSV_ROWS = 100000          # CSV download mein max rows
 MAX_PROFILE_COLUMNS = 30       # report profile mein max columns
 MAX_RESULT_ROWS_FOR_AI = 50    # AI ko query result ki max itni rows dikhengi
+DB_STATEMENT_TIMEOUT_MS = 20000  # koi query 20s se zyada chale to cancel (page freeze nahi hota)
+DB_CONNECT_TIMEOUT_S = 10        # database connect hone ka max wait
 
 try:
     api_key = st.secrets["GEMINI_API_KEY"]
@@ -196,20 +198,44 @@ def get_client(key):
     return genai.Client(api_key=key)
 
 
+def normalize_db_url(url):
+    """'postgresql://' ko explicitly psycopg2 par pin karta hai (naye SQLAlchemy ka default driver alag hai)."""
+    url = url.strip()
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+    if url.startswith("postgresql://"):
+        url = "postgresql+psycopg2://" + url[len("postgresql://"):]
+    return url
+
+
 @st.cache_resource
 def get_main_engine(url):
     # Ek hi engine reuse hota hai (har rerun pe naya connection nahi banta)
-    return create_engine(url, pool_pre_ping=True, pool_recycle=300)
+    engine = create_engine(normalize_db_url(url), pool_pre_ping=True, pool_recycle=300,
+                           connect_args={"connect_timeout": DB_CONNECT_TIMEOUT_S})
+    if engine.dialect.name == "postgresql":
+        @event.listens_for(engine, "connect")
+        def _set_statement_timeout(dbapi_conn, _record):
+            try:
+                cur = dbapi_conn.cursor()
+                cur.execute(f"SET statement_timeout = {int(DB_STATEMENT_TIMEOUT_MS)}")
+                cur.close()
+                dbapi_conn.commit()
+            except Exception:
+                pass
+    return engine
 
 
 client = get_client(api_key)
 
-main_conn = None
+main_conn, db_error = None, ""
 if db_url:
     try:
         main_conn = get_main_engine(db_url)
-    except Exception:
-        main_conn = None
+    except Exception as e:
+        db_error = f"{type(e).__name__}: {str(e)[:300]}"
+else:
+    db_error = "DATABASE_URL is not set."
 
 MAIN_SCHEMA = """
 Tables:
@@ -883,9 +909,29 @@ def show_answer(answer, all_results, timings=None):
 
 # ============================================================
 # SECTION 8: PAGE -- HEADER + DEFAULT INSTACART DASHBOARD
-# Ab poora table load nahi hota -- database se sirf chhote aggregates aate hain (bahut fast).
+# Dashboard pehle saved snapshot (src/dashboard_snapshot.json) se aata hai: instant, aur free-tier
+# database par koi load nahi. Snapshot na ho to live database se chhote aggregate queries chalti hain.
+# Snapshot banane ke liye: python make_dashboard_snapshot.py
 # ============================================================
-@st.cache_data(ttl=3600, show_spinner="Loading dashboard...")
+SNAPSHOT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard_snapshot.json")
+
+
+def load_snapshot():
+    try:
+        with open(SNAPSHOT_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        dept = pd.DataFrame(data["departments"])
+        dept["order_count"] = dept["order_count"].astype(int)
+        dept["reorder_rate"] = dept["reorder_rate"].astype(float)
+        k = data["kpis"]
+        kpis = {"total_orders": int(k["total_orders"]), "total_products": int(k["total_products"]),
+                "reorder_rate": float(k["reorder_rate"])}
+        return kpis, dept, str(data.get("created", ""))
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=86400, show_spinner="Loading dashboard...")
 def load_dashboard_stats(_engine):
     kpis = pd.read_sql_query(
         "SELECT COUNT(DISTINCT order_id) AS total_orders, COUNT(DISTINCT product_id) AS total_products, "
@@ -903,14 +949,21 @@ def load_dashboard_stats(_engine):
 st.title("🛒 AI-Powered Retail Insight Agent")
 st.write("Statistical + AI-driven analytics on Instacart data")
 
-dashboard = None
-if main_conn is not None:
-    _t_dash = time.time()
+dashboard, dashboard_note, dashboard_error = None, "", ""
+_t_dash = time.time()
+_snapshot = load_snapshot()
+if _snapshot is not None:
+    dashboard = _snapshot[:2]
+    dashboard_note = (f"⚡ Pre-computed snapshot of the Instacart sample ({_snapshot[2] or 'saved'}): loads instantly and "
+                      "spares the free-tier database. The AI chat below queries the live database.")
+elif main_conn is not None:
     try:
         dashboard = load_dashboard_stats(main_conn)
-    except Exception:
-        dashboard = None
-    PERF["dashboard data (cached 1h)"] = time.time() - _t_dash
+    except Exception as e:
+        dashboard_error = f"{type(e).__name__}: {str(e)[:400]}"
+else:
+    dashboard_error = db_error or "Database is not configured."
+PERF["dashboard data"] = time.time() - _t_dash
 
 if dashboard is not None:
     kpis, dept_stats = dashboard
@@ -918,6 +971,8 @@ if dashboard is not None:
     col1.metric("Total Orders", f"{kpis['total_orders']:,}")
     col2.metric("Total Products", f"{kpis['total_products']:,}")
     col3.metric("Overall Reorder Rate", f"{kpis['reorder_rate'] * 100:.1f}%")
+    if dashboard_note:
+        st.caption(dashboard_note)
 
     st.divider()
     st.subheader("📊 Department Insights")
@@ -931,7 +986,9 @@ if dashboard is not None:
         st.plotly_chart(px.bar(top_reorder, x="department", y="reorder_rate",
                                title="Top 10 Departments by Reorder Rate"), width="stretch")
 else:
-    st.info("Default Instacart database is unavailable right now. You can still upload your own data below.")
+    st.info("The default Instacart dashboard is unavailable right now. You can still upload your own data below.")
+    with st.expander("Technical details"):
+        st.code(dashboard_error or db_error or "No dashboard snapshot found and no database connection.")
 
 # ============================================================
 # SECTION 9: SIDEBAR
